@@ -536,4 +536,224 @@ async def handle_oauth_code(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         flow = Flow.from_client_config(
             CLIENT_CONFIG,
             scopes=SCOPES,
-            state=data["oauth_s
+            state=data["oauth_sauth_state"],
+            redirect_uri=CLIENT_CONFIG["web"]["redirect_uris"][0]
+        )
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        data["credentials"] = {
+            'token': creds.token,
+            'refresh_token': creds.refresh_token,
+            'token_uri': creds.token_uri,
+            'client_id': creds.client_id,
+            'client_secret': creds.client_secret,
+            'scopes': creds.scopes
+        }
+        
+        await update.message.reply_text("✅ Google Drive authorization successful!")
+        return await cloud_save(update, context)
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Authorization failed: {str(e)}")
+        return ACTION
+
+async def batch_process(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Process multiple files at once."""
+    user_id = update.message.from_user.id
+    data = user_data[user_id]
+    
+    if not data.get("files") or len(data["files"]) < 2:
+        await update.message.reply_text("❌ Not enough files for batch processing.")
+        return ACTION
+    
+    keyboard = [
+        [InlineKeyboardButton("🗜️ Compress All", callback_data="batch_compress")],
+        [InlineKeyboardButton("🔒 Encrypt All", callback_data="batch_encrypt")],
+        [InlineKeyboardButton("🔍 OCR All", callback_data="batch_ocr")],
+        [InlineKeyboardButton("📄 Merge to Single PDF", callback_data="batch_merge")]
+    ]
+    
+    await update.message.reply_text(
+        "🔧 Batch processing options:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return BATCH_PROCESS
+
+async def handle_batch_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle batch processing actions."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    data = user_data[user_id]
+    action = query.data
+    
+    try:
+        if action == "batch_compress":
+            for file_info in data["files"]:
+                if file_info["type"] == "pdf":
+                    with pikepdf.open(file_info["path"]) as pdf:
+                        output_path = os.path.join(data["temp_dir"], f"compressed_{file_info['name']}")
+                        pdf.save(output_path, compress_streams=True)
+                        file_info["path"] = output_path
+            await query.edit_message_text("✅ All PDFs compressed!")
+            
+        elif action == "batch_encrypt":
+            await query.edit_message_text("Enter password for encryption:")
+            data["batch_action"] = "encrypt"
+            return BATCH_PROCESS
+            
+        elif action == "batch_ocr":
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = []
+                for file_info in data["files"]:
+                    if file_info["type"] in ["pdf", "image"]:
+                        futures.append(executor.submit(process_ocr, file_info))
+                
+                for future in concurrent.futures.as_completed(futures):
+                    file_info = future.result()
+            await query.edit_message_text("✅ OCR completed on all files!")
+            
+        elif action == "batch_merge":
+            merger = PdfMerger()
+            for file_info in data["files"]:
+                if file_info["type"] == "pdf":
+                    merger.append(file_info["path"])
+                elif file_info["type"] == "image":
+                    # Convert image to PDF first
+                    pdf_path = convert_image_to_pdf_sync(file_info)
+                    merger.append(pdf_path)
+            
+            output_path = os.path.join(data["temp_dir"], "merged.pdf")
+            merger.write(output_path)
+            merger.close()
+            
+            # Replace files with the merged PDF
+            data["files"] = [{
+                "path": output_path,
+                "name": "merged.pdf",
+                "type": "pdf"
+            }]
+            await query.edit_message_text("✅ All files merged into single PDF!")
+            
+        return ACTION
+        
+    except Exception as e:
+        await query.edit_message_text(f"❌ Batch processing error: {str(e)}")
+        return ACTION
+
+def process_ocr(file_info):
+    """Process OCR for a single file in batch."""
+    if file_info["type"] == "pdf":
+        images = convert_from_path(file_info["path"], dpi=300)
+        ocr_path = os.path.join(os.path.dirname(file_info["path"]), f"ocr_{file_info['name']}")
+        with open(ocr_path, "wb") as f:
+            with PdfWriter() as writer:
+                for image in images:
+                    text = pytesseract.image_to_pdf_or_hocr(image, extension='pdf')
+                    reader = PdfReader(io.BytesIO(text))
+                    writer.add_page(reader.pages[0])
+                writer.write(f)
+        file_info["path"] = ocr_path
+    else:  # Image
+        text = pytesseract.image_to_string(Image.open(file_info["path"]))
+        ocr_path = os.path.join(os.path.dirname(file_info["path"]), f"ocr_{os.path.splitext(file_info['name'])[0]}.txt")
+        with open(ocr_path, "w") as f:
+            f.write(text)
+        file_info["path"] = ocr_path
+        file_info["type"] = "text"
+    return file_info
+
+async def convert_image_to_pdf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Convert image to PDF."""
+    query = update.callback_query
+    user_id = query.from_user.id
+    data = user_data[user_id]
+    file_info = data["files"][0]
+    
+    try:
+        if file_info["type"] != "image":
+            await query.edit_message_text("❌ This is not an image file.")
+            return ACTION
+        
+        pdf_path = convert_image_to_pdf_sync(file_info)
+        file_info["path"] = pdf_path
+        file_info["name"] = os.path.splitext(file_info["name"])[0] + ".pdf"
+        file_info["type"] = "pdf"
+        
+        await query.edit_message_text("✅ Image converted to PDF! Choose another action or get result.")
+        return ACTION
+        
+    except Exception as e:
+        await query.edit_message_text(f"❌ Conversion error: {str(e)}")
+        return ACTION
+
+def convert_image_to_pdf_sync(file_info):
+    """Convert image to PDF (synchronous version)."""
+    image = Image.open(file_info["path"])
+    pdf_path = os.path.join(os.path.dirname(file_info["path"]), 
+                           f"{os.path.splitext(file_info['name'])[0]}.pdf")
+    
+    if image.mode == 'RGBA':
+        image = image.convert('RGB')
+        
+    image.save(pdf_path, "PDF", resolution=100.0)
+    return pdf_path
+
+# ... (Existing functions: finish_editing, cancel) ...
+
+def main() -> None:
+    """Start the bot."""
+    TOKEN = 7494858344:AAHrPJcxrAztwuERShGWQoOQ42qpePGxj18
+    
+    app = Application.builder().token(TOKEN).build()
+    
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            UPLOAD: [
+                MessageHandler(filters.Document.PDF | filters.Document.IMAGE, handle_document),
+                MessageHandler(filters.PHOTO, handle_photo),
+                CommandHandler("process", batch_process)
+            ],
+            ACTION: [
+                CallbackQueryHandler(handle_action)
+            ],
+            DELETE_PAGES: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, delete_pages)
+            ],
+            INSERT_PAGE: [
+                MessageHandler(filters.Document.PDF, insert_page)
+            ],
+            REARRANGE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, rearrange_pages)
+            ],
+            OCR: [
+                CallbackQueryHandler(handle_action)
+            ],
+            ENCRYPT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, encrypt_pdf)
+            ],
+            WATERMARK: [
+                CallbackQueryHandler(handle_watermark),
+                MessageHandler(filters.TEXT | filters.PHOTO | filters.Document.IMAGE, apply_watermark)
+            ],
+            CLOUD_SAVE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_oauth_code)
+            ],
+            BATCH_PROCESS: [
+                CallbackQueryHandler(handle_batch_action),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_batch_password)
+            ],
+            IMAGE_TO_PDF: [
+                CallbackQueryHandler(handle_action)
+            ]
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+    )
+    
+    app.add_handler(conv_handler)
+    app.run_polling()
+
+if __name__ == "__main__":
+    main()
+```
